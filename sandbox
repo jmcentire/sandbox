@@ -1,0 +1,348 @@
+#!/usr/bin/env python3
+"""
+Sandbox CLI Tool - Creates isolated sandboxed environments
+Usage: sandbox --config sb.conf --mnt /home/jmcentire
+"""
+
+import os
+import sys
+import argparse
+import subprocess
+import tempfile
+import shutil
+import json
+import pwd
+import grp
+from pathlib import Path
+import configparser
+
+class SandboxManager:
+    def __init__(self, config_file, mount_dir=None):
+        self.config_file = config_file
+        self.mount_dir = mount_dir
+        self.sandbox_root = None
+        self.config = {}
+        self.load_config()
+        
+    def load_config(self):
+        """Load sandbox configuration from file"""
+        if not os.path.exists(self.config_file):
+            print(f"Error: Config file {self.config_file} not found")
+            sys.exit(1)
+            
+        config = configparser.ConfigParser()
+        config.read(self.config_file)
+        
+        # Default configuration
+        self.config = {
+            'allowed_ports': [80, 443, 22, 21, 990],  # HTTP, HTTPS, SSH, FTP, FTPS
+            'allowed_ips': ['0.0.0.0/0'],  # Allow all by default
+            'packages': [],
+            'applications': [],
+            'env_vars': {},
+            'network_enabled': True,
+            'internet_access': True
+        }
+        
+        # Parse config sections
+        if 'network' in config:
+            if 'allowed_ports' in config['network']:
+                self.config['allowed_ports'] = [
+                    int(p.strip()) for p in config['network']['allowed_ports'].split(',')
+                ]
+            if 'allowed_ips' in config['network']:
+                self.config['allowed_ips'] = [
+                    ip.strip() for ip in config['network']['allowed_ips'].split(',')
+                ]
+            if 'enabled' in config['network']:
+                self.config['network_enabled'] = config['network'].getboolean('enabled')
+            if 'internet_access' in config['network']:
+                self.config['internet_access'] = config['network'].getboolean('internet_access')
+                
+        if 'packages' in config:
+            if 'install' in config['packages']:
+                self.config['packages'] = [
+                    pkg.strip() for pkg in config['packages']['install'].split(',')
+                ]
+                
+        if 'applications' in config:
+            if 'include' in config['applications']:
+                self.config['applications'] = [
+                    app.strip() for app in config['applications']['include'].split(',')
+                ]
+                
+        if 'environment' in config:
+            self.config['env_vars'] = dict(config['environment'])
+
+    def create_sandbox_root(self):
+        """Create the sandbox root directory structure"""
+        self.sandbox_root = tempfile.mkdtemp(prefix='sandbox_')
+        print(f"Creating sandbox at: {self.sandbox_root}")
+        
+        # Create basic directory structure
+        dirs_to_create = [
+            'bin', 'sbin', 'usr/bin', 'usr/sbin', 'usr/local/bin',
+            'lib', 'lib64', 'usr/lib', 'usr/lib64',
+            'etc', 'dev', 'proc', 'sys', 'tmp', 'var/tmp',
+            'home', 'root'
+        ]
+        
+        for dir_path in dirs_to_create:
+            os.makedirs(os.path.join(self.sandbox_root, dir_path), exist_ok=True)
+            
+        # Set proper permissions
+        os.chmod(os.path.join(self.sandbox_root, 'tmp'), 0o1777)
+        os.chmod(os.path.join(self.sandbox_root, 'var/tmp'), 0o1777)
+
+    def copy_essential_binaries(self):
+        """Copy essential binaries and libraries"""
+        essential_bins = [
+            '/bin/bash', '/bin/sh', '/bin/ls', '/bin/cat', '/bin/grep',
+            '/bin/sed', '/bin/awk', '/bin/cp', '/bin/mv', '/bin/rm',
+            '/bin/mkdir', '/bin/rmdir', '/bin/chmod', '/bin/chown',
+            '/usr/bin/vim', '/usr/bin/nano', '/usr/bin/python3',
+            '/usr/bin/ssh', '/usr/bin/curl', '/usr/bin/wget',
+            '/usr/bin/git', '/bin/tar', '/bin/gzip', '/bin/gunzip'
+        ]
+        
+        # Add configured applications
+        for app in self.config['applications']:
+            app_path = shutil.which(app)
+            if app_path:
+                essential_bins.append(app_path)
+            else:
+                print(f"Warning: Application {app} not found")
+        
+        for bin_path in essential_bins:
+            if os.path.exists(bin_path):
+                self.copy_binary_with_deps(bin_path)
+            else:
+                print(f"Warning: {bin_path} not found, skipping")
+
+    def copy_binary_with_deps(self, binary_path):
+        """Copy binary and its library dependencies"""
+        try:
+            # Determine destination path in sandbox
+            if binary_path.startswith('/usr/'):
+                dest_path = os.path.join(self.sandbox_root, binary_path[1:])
+            else:
+                dest_path = os.path.join(self.sandbox_root, binary_path[1:])
+            
+            # Create directory structure
+            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+            
+            # Copy the binary
+            shutil.copy2(binary_path, dest_path)
+            
+            # Get library dependencies
+            try:
+                result = subprocess.run(['ldd', binary_path], 
+                                      capture_output=True, text=True, check=True)
+                
+                for line in result.stdout.split('\n'):
+                    if '=>' in line:
+                        parts = line.strip().split('=>')
+                        if len(parts) == 2 and parts[1].strip():
+                            lib_path = parts[1].strip().split()[0]
+                            if os.path.exists(lib_path) and lib_path != '(0x':
+                                self.copy_library(lib_path)
+                                
+            except subprocess.CalledProcessError:
+                # Binary might be statically linked or ldd might fail
+                pass
+                
+        except Exception as e:
+            print(f"Warning: Failed to copy {binary_path}: {e}")
+
+    def copy_library(self, lib_path):
+        """Copy library to sandbox"""
+        try:
+            dest_path = os.path.join(self.sandbox_root, lib_path[1:])
+            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+            
+            if not os.path.exists(dest_path):
+                shutil.copy2(lib_path, dest_path)
+                
+        except Exception as e:
+            print(f"Warning: Failed to copy library {lib_path}: {e}")
+
+    def setup_etc_files(self):
+        """Setup essential /etc files"""
+        etc_files = {
+            'passwd': f"root:x:0:0:root:/root:/bin/bash\nnobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n",
+            'group': f"root:x:0:\nnogroup:x:65534:\n",
+            'hosts': "127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback\n",
+            'resolv.conf': "nameserver 8.8.8.8\nnameserver 8.8.4.4\n",
+            'nsswitch.conf': "passwd: files\ngroup: files\nhosts: files dns\n"
+        }
+        
+        for filename, content in etc_files.items():
+            with open(os.path.join(self.sandbox_root, 'etc', filename), 'w') as f:
+                f.write(content)
+
+    def setup_mount_point(self):
+        """Setup the mount point for user directory"""
+        if self.mount_dir:
+            mount_point = os.path.join(self.sandbox_root, 'mnt')
+            os.makedirs(mount_point, exist_ok=True)
+
+    def setup_python_environment(self):
+        """Setup Python environment and install packages"""
+        if self.config['packages']:
+            print("Installing Python packages...")
+            # Create a requirements file
+            req_file = os.path.join(self.sandbox_root, 'tmp', 'requirements.txt')
+            with open(req_file, 'w') as f:
+                for package in self.config['packages']:
+                    f.write(f"{package}\n")
+
+    def setup_network_rules(self):
+        """Setup network access rules (placeholder for iptables rules)"""
+        if not self.config['network_enabled']:
+            print("Network access disabled in sandbox")
+            return
+            
+        print(f"Network config: Ports {self.config['allowed_ports']}, IPs {self.config['allowed_ips']}")
+        
+        # Note: Actual iptables rules would require root privileges
+        # This is a placeholder for the network configuration
+
+    def enter_sandbox(self):
+        """Enter the sandbox environment"""
+        print("Entering sandbox environment...")
+        print("Type 'exit' to leave the sandbox")
+        
+        # Prepare environment variables
+        env = os.environ.copy()
+        env.update(self.config['env_vars'])
+        env['PS1'] = '[SANDBOX] \\u@\\h:\\w$ '
+        env['PATH'] = '/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'
+        
+        # Create startup script
+        startup_script = os.path.join(self.sandbox_root, 'tmp', 'sandbox_init.sh')
+        with open(startup_script, 'w') as f:
+            f.write('#!/bin/bash\n')
+            f.write('echo "Welcome to Sandbox Environment"\n')
+            f.write('echo "Mounted directory available at /mnt"\n')
+            f.write('echo "Available commands: ls, cat, vim, python3, ssh, curl, wget, git"\n')
+            f.write('echo ""\n')
+            if self.mount_dir:
+                f.write(f'mount --bind "{self.mount_dir}" /mnt 2>/dev/null || echo "Note: Mount requires root privileges"\n')
+            # Install Python packages if specified
+            if self.config['packages']:
+                f.write('if [ -f /tmp/requirements.txt ]; then\n')
+                f.write('    echo "Installing Python packages..."\n')
+                f.write('    python3 -m pip install --user -r /tmp/requirements.txt\n')
+                f.write('fi\n')
+            f.write('cd /mnt 2>/dev/null || cd /\n')
+            f.write('exec /bin/bash\n')
+        
+        os.chmod(startup_script, 0o755)
+        
+        try:
+            # Use unshare to create new namespaces (requires root for full isolation)
+            cmd = [
+                'unshare', '--fork', '--pid', '--mount',
+                'chroot', self.sandbox_root,
+                '/tmp/sandbox_init.sh'
+            ]
+            
+            # If not root, try with user namespaces
+            if os.getuid() != 0:
+                print("Note: Running without root privileges. Some isolation features may be limited.")
+                cmd = ['chroot', self.sandbox_root, '/tmp/sandbox_init.sh']
+            
+            subprocess.run(cmd, env=env)
+            
+        except subprocess.CalledProcessError as e:
+            print(f"Failed to enter sandbox: {e}")
+            print("Falling back to basic chroot...")
+            try:
+                subprocess.run(['chroot', self.sandbox_root, '/bin/bash'], env=env)
+            except subprocess.CalledProcessError:
+                print("Chroot failed. Entering sandbox directory directly...")
+                os.chdir(self.sandbox_root)
+                subprocess.run(['/bin/bash'], env=env)
+
+    def cleanup(self):
+        """Clean up sandbox environment"""
+        if self.sandbox_root and os.path.exists(self.sandbox_root):
+            print(f"Cleaning up sandbox at {self.sandbox_root}")
+            try:
+                # Unmount if needed
+                if self.mount_dir:
+                    subprocess.run(['umount', os.path.join(self.sandbox_root, 'mnt')], 
+                                 stderr=subprocess.DEVNULL)
+                
+                shutil.rmtree(self.sandbox_root)
+            except Exception as e:
+                print(f"Warning: Failed to clean up sandbox: {e}")
+
+def create_sample_config():
+    """Create a sample configuration file"""
+    config_content = """[network]
+# Allowed outbound ports (comma-separated)
+allowed_ports = 80,443,22,21,990
+
+# Allowed IP addresses/ranges (comma-separated)
+allowed_ips = 0.0.0.0/0
+
+# Enable/disable network access
+enabled = true
+internet_access = true
+
+[packages]
+# Python packages to install (comma-separated)
+install = requests,numpy,pandas
+
+[applications]
+# Additional applications to include (comma-separated)
+include = htop,tree,jq
+
+[environment]
+# Environment variables
+EDITOR = vim
+PYTHONPATH = /usr/local/lib/python3.*/site-packages
+"""
+    
+    with open('sb.conf.example', 'w') as f:
+        f.write(config_content)
+    
+    print("Sample configuration created as 'sb.conf.example'")
+
+def main():
+    parser = argparse.ArgumentParser(description='Sandbox CLI Tool')
+    parser.add_argument('--config', required=True, help='Configuration file path')
+    parser.add_argument('--mnt', help='Directory to mount in sandbox')
+    parser.add_argument('--create-sample-config', action='store_true', 
+                       help='Create a sample configuration file')
+    
+    args = parser.parse_args()
+    
+    if args.create_sample_config:
+        create_sample_config()
+        return
+    
+    if os.getuid() != 0:
+        print("Warning: This tool works best when run as root for full isolation.")
+        print("Running with limited privileges...")
+    
+    sandbox = SandboxManager(args.config, args.mnt)
+    
+    try:
+        sandbox.create_sandbox_root()
+        sandbox.copy_essential_binaries()
+        sandbox.setup_etc_files()
+        sandbox.setup_mount_point()
+        sandbox.setup_python_environment()
+        sandbox.setup_network_rules()
+        sandbox.enter_sandbox()
+    except KeyboardInterrupt:
+        print("\nSandbox interrupted by user")
+    except Exception as e:
+        print(f"Error: {e}")
+    finally:
+        sandbox.cleanup()
+
+if __name__ == '__main__':
+    main()

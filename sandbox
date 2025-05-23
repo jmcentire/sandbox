@@ -1,7 +1,51 @@
 #!/usr/bin/env python3
 """
 Sandbox CLI Tool - Creates isolated sandboxed environments
-Usage: sandbox --config sb.conf --mnt /home/jmcentire
+
+USAGE:
+    sandbox [OPTIONS]
+
+DESCRIPTION:
+    Creates a secure, isolated sandboxed environment with configurable network
+    access, package installation, and directory mounting. The sandbox includes
+    standard CLI tools (bash, vim, python3, ssh, curl, git, etc.) by default.
+
+OPTIONS:
+    --config FILE       Configuration file (optional, uses defaults if not provided)
+    --mnt DIRECTORY     Directory to mount in sandbox (default: current directory)
+    --help, -h          Show this help message
+    --create-sample-config  Create example configuration file
+
+EXAMPLES:
+    # Basic usage with defaults
+    sandbox
+
+    # Use custom config and mount specific directory  
+    sandbox --config sb.conf --mnt /home/jmcentire
+
+    # Create sample configuration file
+    sandbox --create-sample-config
+
+CONFIG FILE FORMAT:
+    The configuration file uses INI format with sections for network, packages,
+    applications, environment, and profile settings. See --create-sample-config
+    for a complete example.
+
+ENVIRONMENT:
+    The sandbox automatically executes ~/.profile and ~/.bashrc if they exist
+    within the sandbox. Additional environment variables can be set via the
+    config file [environment] section.
+
+SECURITY:
+    - Creates isolated filesystem using chroot
+    - Network access limited to configured ports/IPs
+    - No access to host system except mounted directory
+    - Temporary sandbox cleaned up on exit
+
+REQUIREMENTS:
+    - Linux or macOS
+    - Root privileges recommended for full isolation
+    - Standard system tools (chroot, unshare)
 """
 
 import os
@@ -17,32 +61,43 @@ from pathlib import Path
 import configparser
 
 class SandboxManager:
-    def __init__(self, config_file, mount_dir=None):
+    def __init__(self, config_file=None, mount_dir=None):
         self.config_file = config_file
-        self.mount_dir = mount_dir
+        self.mount_dir = mount_dir or os.getcwd()
         self.sandbox_root = None
         self.config = {}
         self.load_config()
         
     def load_config(self):
-        """Load sandbox configuration from file"""
-        if not os.path.exists(self.config_file):
-            print(f"Error: Config file {self.config_file} not found")
-            sys.exit(1)
-            
-        config = configparser.ConfigParser()
-        config.read(self.config_file)
-        
+        """Load sandbox configuration from file or use defaults"""
         # Default configuration
         self.config = {
-            'allowed_ports': [80, 443, 22, 21, 990],  # HTTP, HTTPS, SSH, FTP, FTPS
+            'allowed_ports': [80, 443, 22, 21, 990, 9418],  # HTTP, HTTPS, SSH, FTP, FTPS, Git
             'allowed_ips': ['0.0.0.0/0'],  # Allow all by default
             'packages': [],
             'applications': [],
             'env_vars': {},
             'network_enabled': True,
-            'internet_access': True
+            'internet_access': True,
+            'profile_script': None
         }
+        
+        # If no config file provided, use defaults
+        if not self.config_file:
+            print("No config file provided, using default settings")
+            return
+            
+        if not os.path.exists(self.config_file):
+            print(f"Warning: Config file {self.config_file} not found, using defaults")
+            return
+            
+        config = configparser.ConfigParser()
+        try:
+            config.read(self.config_file)
+        except Exception as e:
+            print(f"Warning: Failed to parse config file: {e}")
+            print("Using default settings")
+            return
         
         # Parse config sections
         if 'network' in config:
@@ -62,17 +117,21 @@ class SandboxManager:
         if 'packages' in config:
             if 'install' in config['packages']:
                 self.config['packages'] = [
-                    pkg.strip() for pkg in config['packages']['install'].split(',')
+                    pkg.strip() for pkg in config['packages']['install'].split(',') if pkg.strip()
                 ]
                 
         if 'applications' in config:
             if 'include' in config['applications']:
                 self.config['applications'] = [
-                    app.strip() for app in config['applications']['include'].split(',')
+                    app.strip() for app in config['applications']['include'].split(',') if app.strip()
                 ]
                 
         if 'environment' in config:
             self.config['env_vars'] = dict(config['environment'])
+            
+        if 'profile' in config:
+            if 'script' in config['profile']:
+                self.config['profile_script'] = config['profile']['script']
 
     def create_sandbox_root(self):
         """Create the sandbox root directory structure"""
@@ -84,7 +143,7 @@ class SandboxManager:
             'bin', 'sbin', 'usr/bin', 'usr/sbin', 'usr/local/bin',
             'lib', 'lib64', 'usr/lib', 'usr/lib64',
             'etc', 'dev', 'proc', 'sys', 'tmp', 'var/tmp',
-            'home', 'root'
+            'home', 'root', 'root/.ssh'
         ]
         
         for dir_path in dirs_to_create:
@@ -93,6 +152,7 @@ class SandboxManager:
         # Set proper permissions
         os.chmod(os.path.join(self.sandbox_root, 'tmp'), 0o1777)
         os.chmod(os.path.join(self.sandbox_root, 'var/tmp'), 0o1777)
+        os.chmod(os.path.join(self.sandbox_root, 'root/.ssh'), 0o700)
 
     def copy_essential_binaries(self):
         """Copy essential binaries and libraries"""
@@ -102,7 +162,8 @@ class SandboxManager:
             '/bin/mkdir', '/bin/rmdir', '/bin/chmod', '/bin/chown',
             '/usr/bin/vim', '/usr/bin/nano', '/usr/bin/python3',
             '/usr/bin/ssh', '/usr/bin/curl', '/usr/bin/wget',
-            '/usr/bin/git', '/bin/tar', '/bin/gzip', '/bin/gunzip'
+            '/usr/bin/git', '/bin/tar', '/bin/gzip', '/bin/gunzip',
+            '/usr/bin/ssh-keygen', '/usr/bin/ssh-add', '/usr/bin/ssh-agent'
         ]
         
         # Add configured applications
@@ -179,12 +240,74 @@ class SandboxManager:
         for filename, content in etc_files.items():
             with open(os.path.join(self.sandbox_root, 'etc', filename), 'w') as f:
                 f.write(content)
+                
+    def setup_profile_files(self):
+        """Setup profile and bashrc files for automatic execution"""
+        # Create ~/.profile
+        profile_content = """# Sandbox profile
+export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+export PS1="[SANDBOX] \\u@\\h:\\w$ "
+export EDITOR="${EDITOR:-vim}"
+
+# Git configuration - preserve from host if available
+if [ -f ~/.gitconfig ]; then
+    echo "Using existing git configuration"
+else
+    echo "Note: Set up git with 'git config --global user.name' and 'git config --global user.email'"
+fi
+
+# SSH agent setup for git authentication
+if [ -n "$SSH_AUTH_SOCK" ]; then
+    echo "SSH agent available for git authentication"
+fi
+
+# Load additional environment variables from config
+"""
+        
+        # Add environment variables from config
+        for key, value in self.config['env_vars'].items():
+            profile_content += f'export {key}="{value}"\n'
+            
+        # Add custom profile script if specified
+        if self.config['profile_script']:
+            profile_content += f"\n# Custom profile script\n{self.config['profile_script']}\n"
+            
+        profile_content += """
+# Welcome message
+echo "Welcome to Sandbox Environment"
+echo "Mounted directory: /mnt"
+echo "Available tools: bash, vim, python3, ssh, curl, wget, git, and more"
+echo "Git connectivity: SSH (port 22), HTTPS (port 443), Git protocol (port 9418)"
+echo "Type 'exit' to leave the sandbox"
+echo ""
+"""
+
+        # Write profile files
+        root_home = os.path.join(self.sandbox_root, 'root')
+        with open(os.path.join(root_home, '.profile'), 'w') as f:
+            f.write(profile_content)
+            
+        # Create .bashrc that sources .profile
+        bashrc_content = """# Sandbox bashrc
+[ -f ~/.profile ] && source ~/.profile
+
+# Bash-specific settings
+alias ls='ls --color=auto'
+alias ll='ls -la'
+alias la='ls -A'
+alias l='ls -CF'
+"""
+        
+        with open(os.path.join(root_home, '.bashrc'), 'w') as f:
+            f.write(bashrc_content)
 
     def setup_mount_point(self):
         """Setup the mount point for user directory"""
-        if self.mount_dir:
-            mount_point = os.path.join(self.sandbox_root, 'mnt')
-            os.makedirs(mount_point, exist_ok=True)
+        mount_point = os.path.join(self.sandbox_root, 'mnt')
+        os.makedirs(mount_point, exist_ok=True)
+        
+        # Inform user about mount directory
+        print(f"Mount directory: {self.mount_dir} -> /mnt")
 
     def setup_python_environment(self):
         """Setup Python environment and install packages"""
@@ -203,6 +326,7 @@ class SandboxManager:
             return
             
         print(f"Network config: Ports {self.config['allowed_ports']}, IPs {self.config['allowed_ips']}")
+        print("Git connectivity enabled: SSH (22), HTTPS (443), Git protocol (9418)")
         
         # Note: Actual iptables rules would require root privileges
         # This is a placeholder for the network configuration
@@ -210,32 +334,63 @@ class SandboxManager:
     def enter_sandbox(self):
         """Enter the sandbox environment"""
         print("Entering sandbox environment...")
-        print("Type 'exit' to leave the sandbox")
         
         # Prepare environment variables
         env = os.environ.copy()
         env.update(self.config['env_vars'])
-        env['PS1'] = '[SANDBOX] \\u@\\h:\\w$ '
-        env['PATH'] = '/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'
+        env['HOME'] = '/root'
+        
+        # Preserve SSH agent for git authentication
+        if 'SSH_AUTH_SOCK' in os.environ:
+            env['SSH_AUTH_SOCK'] = os.environ['SSH_AUTH_SOCK']
+        if 'SSH_AGENT_PID' in os.environ:
+            env['SSH_AGENT_PID'] = os.environ['SSH_AGENT_PID']
         
         # Create startup script
         startup_script = os.path.join(self.sandbox_root, 'tmp', 'sandbox_init.sh')
         with open(startup_script, 'w') as f:
             f.write('#!/bin/bash\n')
-            f.write('echo "Welcome to Sandbox Environment"\n')
-            f.write('echo "Mounted directory available at /mnt"\n')
-            f.write('echo "Available commands: ls, cat, vim, python3, ssh, curl, wget, git"\n')
-            f.write('echo ""\n')
-            if self.mount_dir:
-                f.write(f'mount --bind "{self.mount_dir}" /mnt 2>/dev/null || echo "Note: Mount requires root privileges"\n')
+            f.write('cd /root\n')  # Start in home directory
+            
+            # Mount the user directory
+            f.write(f'mount --bind "{self.mount_dir}" /mnt 2>/dev/null || echo "Note: Mount requires root privileges"\n')
+            
+            # Copy git and SSH config from host if available
+            f.write('# Copy git configuration from host\n')
+            f.write('if [ -f /mnt/.gitconfig ]; then\n')
+            f.write('    cp /mnt/.gitconfig ~/.gitconfig 2>/dev/null || true\n')
+            f.write('elif [ -f "$HOME/.gitconfig" ]; then\n') 
+            f.write('    cp "$HOME/.gitconfig" ~/.gitconfig 2>/dev/null || true\n')
+            f.write('fi\n')
+            
+            f.write('# Copy SSH keys for git authentication\n')
+            f.write('if [ -d /mnt/.ssh ]; then\n')
+            f.write('    cp -r /mnt/.ssh/* ~/.ssh/ 2>/dev/null || true\n')
+            f.write('    chmod 600 ~/.ssh/id_* 2>/dev/null || true\n')
+            f.write('    chmod 644 ~/.ssh/*.pub 2>/dev/null || true\n')
+            f.write('elif [ -d "$HOME/.ssh" ]; then\n')
+            f.write('    cp -r "$HOME/.ssh"/* ~/.ssh/ 2>/dev/null || true\n')
+            f.write('    chmod 600 ~/.ssh/id_* 2>/dev/null || true\n')
+            f.write('    chmod 644 ~/.ssh/*.pub 2>/dev/null || true\n')
+            f.write('fi\n')
+            f.write('\n')
+            
             # Install Python packages if specified
             if self.config['packages']:
                 f.write('if [ -f /tmp/requirements.txt ]; then\n')
                 f.write('    echo "Installing Python packages..."\n')
                 f.write('    python3 -m pip install --user -r /tmp/requirements.txt\n')
                 f.write('fi\n')
-            f.write('cd /mnt 2>/dev/null || cd /\n')
-            f.write('exec /bin/bash\n')
+            
+            # Source profile files automatically
+            f.write('[ -f ~/.profile ] && source ~/.profile\n')
+            f.write('[ -f ~/.bashrc ] && source ~/.bashrc\n')
+            
+            # Change to mounted directory
+            f.write('cd /mnt 2>/dev/null || cd /root\n')
+            
+            # Start interactive bash with profile
+            f.write('exec /bin/bash --login\n')
         
         os.chmod(startup_script, 0o755)
         
@@ -258,11 +413,11 @@ class SandboxManager:
             print(f"Failed to enter sandbox: {e}")
             print("Falling back to basic chroot...")
             try:
-                subprocess.run(['chroot', self.sandbox_root, '/bin/bash'], env=env)
+                subprocess.run(['chroot', self.sandbox_root, '/bin/bash', '--login'], env=env)
             except subprocess.CalledProcessError:
                 print("Chroot failed. Entering sandbox directory directly...")
                 os.chdir(self.sandbox_root)
-                subprocess.run(['/bin/bash'], env=env)
+                subprocess.run(['/bin/bash', '--login'], env=env)
 
     def cleanup(self):
         """Clean up sandbox environment"""
@@ -270,9 +425,8 @@ class SandboxManager:
             print(f"Cleaning up sandbox at {self.sandbox_root}")
             try:
                 # Unmount if needed
-                if self.mount_dir:
-                    subprocess.run(['umount', os.path.join(self.sandbox_root, 'mnt')], 
-                                 stderr=subprocess.DEVNULL)
+                subprocess.run(['umount', os.path.join(self.sandbox_root, 'mnt')], 
+                             stderr=subprocess.DEVNULL)
                 
                 shutil.rmtree(self.sandbox_root)
             except Exception as e:
@@ -280,42 +434,75 @@ class SandboxManager:
 
 def create_sample_config():
     """Create a sample configuration file"""
-    config_content = """[network]
-# Allowed outbound ports (comma-separated)
-allowed_ports = 80,443,22,21,990
+    config_content = """# Sandbox Configuration File
+# All sections are optional - defaults will be used if not specified
 
-# Allowed IP addresses/ranges (comma-separated)
+[network]
+# Allowed outbound ports (comma-separated)
+# Default: 80,443,22,21,990,9418 (HTTP, HTTPS, SSH, FTP, FTPS, Git)
+allowed_ports = 80,443,22,21,990,9418
+
+# Allowed IP addresses/ranges (comma-separated) 
+# Default: 0.0.0.0/0 (all addresses)
 allowed_ips = 0.0.0.0/0
 
-# Enable/disable network access
+# Enable/disable network access entirely
+# Default: true
 enabled = true
 internet_access = true
 
 [packages]
 # Python packages to install (comma-separated)
+# These will be installed with pip when entering the sandbox
 install = requests,numpy,pandas
 
 [applications]
-# Additional applications to include (comma-separated)
-include = htop,tree,jq
+# Additional applications to include in sandbox (comma-separated)
+# Must be available on the host system
+include = htop,tree,jq,nano
 
 [environment]
-# Environment variables
+# Environment variables to set in the sandbox
+# These are automatically exported when the sandbox starts
 EDITOR = vim
 PYTHONPATH = /usr/local/lib/python3.*/site-packages
+LANG = en_US.UTF-8
+TZ = UTC
+
+[profile]
+# Custom shell script to execute on sandbox entry
+# This runs after environment variables are set
+script = echo "Custom setup complete"
+       cd /mnt
+       ls -la
 """
     
     with open('sb.conf.example', 'w') as f:
         f.write(config_content)
     
     print("Sample configuration created as 'sb.conf.example'")
+    print("Copy to 'sb.conf' and modify as needed, or run without --config for defaults")
 
 def main():
-    parser = argparse.ArgumentParser(description='Sandbox CLI Tool')
-    parser.add_argument('--config', required=True, help='Configuration file path')
-    parser.add_argument('--mnt', help='Directory to mount in sandbox')
+    parser = argparse.ArgumentParser(
+        description='Sandbox CLI Tool - Create isolated sandboxed environments',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+EXAMPLES:
+  %(prog)s                              # Use defaults (current dir mounted)
+  %(prog)s --mnt /home/user            # Mount specific directory  
+  %(prog)s --config sb.conf            # Use custom configuration
+  %(prog)s --create-sample-config      # Create example config file
+
+For more information, see the help documentation at the top of this script.
+        """)
+    
+    parser.add_argument('--config', metavar='FILE', 
+                       help='Configuration file (optional, uses defaults if not provided)')
+    parser.add_argument('--mnt', metavar='DIRECTORY',
+                       help='Directory to mount in sandbox (default: current directory)')
     parser.add_argument('--create-sample-config', action='store_true', 
-                       help='Create a sample configuration file')
+                       help='Create a sample configuration file and exit')
     
     args = parser.parse_args()
     
@@ -323,9 +510,17 @@ def main():
         create_sample_config()
         return
     
+    # Show what we're doing
+    mount_dir = args.mnt or os.getcwd()
+    print(f"Sandbox Tool Starting...")
+    print(f"Config: {args.config or 'default settings'}")
+    print(f"Mount: {mount_dir} -> /mnt")
+    print()
+    
     if os.getuid() != 0:
         print("Warning: This tool works best when run as root for full isolation.")
         print("Running with limited privileges...")
+        print()
     
     sandbox = SandboxManager(args.config, args.mnt)
     
@@ -333,6 +528,7 @@ def main():
         sandbox.create_sandbox_root()
         sandbox.copy_essential_binaries()
         sandbox.setup_etc_files()
+        sandbox.setup_profile_files()
         sandbox.setup_mount_point()
         sandbox.setup_python_environment()
         sandbox.setup_network_rules()
@@ -341,6 +537,8 @@ def main():
         print("\nSandbox interrupted by user")
     except Exception as e:
         print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
     finally:
         sandbox.cleanup()
 

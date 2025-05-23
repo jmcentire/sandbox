@@ -18,6 +18,13 @@ Clone this repository and make the `sandbox` script executable:
 chmod +x sandbox
 ```
 
+## Requirements
+
+- Linux is fully supported. macOS can run the script with limited features
+  because `chroot` and namespace tools are restricted.
+- Binaries are located using the `which` command rather than assuming fixed
+  paths.
+
 ## Usage
 
 ```bash

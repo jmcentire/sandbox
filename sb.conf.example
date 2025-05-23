@@ -1,0 +1,46 @@
+# Sandbox Configuration File
+# All sections are optional - defaults will be used if not specified
+
+[network]
+# Allowed outbound ports (comma-separated)
+# Default: 80,443,22,21,990,9418 (HTTP, HTTPS, SSH, FTP, FTPS, Git)
+allowed_ports = 80,443,22,21,990,9418
+
+# Allowed IP addresses/ranges (comma-separated) 
+# Default: 0.0.0.0/0 (all addresses)
+allowed_ips = 0.0.0.0/0
+
+# Enable/disable network access entirely
+# Default: true
+enabled = true
+internet_access = true
+
+[packages]
+# Python packages to install (comma-separated)
+# These will be installed with pip when entering the sandbox
+install = requests,numpy,pandas
+
+[applications]
+# Additional applications to include in sandbox (comma-separated)
+# Must be available on the host system
+include = htop,tree,jq,nano
+
+[ssh]
+# SSH keys to copy into the sandbox (comma-separated)
+# Omit or leave empty to copy all keys found in ~/.ssh or the mounted directory
+keys = id_rsa,id_ed25519
+
+[environment]
+# Environment variables to set in the sandbox
+# These are automatically exported when the sandbox starts
+EDITOR = vim
+PYTHONPATH = /usr/local/lib/python3.*/site-packages
+LANG = en_US.UTF-8
+TZ = UTC
+
+[profile]
+# Custom shell script to execute on sandbox entry
+# This runs after environment variables are set
+script = echo "Custom setup complete"
+       cd /mnt
+       ls -la

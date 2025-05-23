@@ -79,7 +79,8 @@ class SandboxManager:
             'env_vars': {},
             'network_enabled': True,
             'internet_access': True,
-            'profile_script': None
+            'profile_script': None,
+            'ssh_keys': []  # SSH keys to copy into the sandbox (empty => all)
         }
         
         # If no config file provided, use defaults
@@ -132,6 +133,12 @@ class SandboxManager:
         if 'profile' in config:
             if 'script' in config['profile']:
                 self.config['profile_script'] = config['profile']['script']
+
+        if 'ssh' in config:
+            if 'keys' in config['ssh']:
+                self.config['ssh_keys'] = [
+                    key.strip() for key in config['ssh']['keys'].split(',') if key.strip()
+                ]
 
     def create_sandbox_root(self):
         """Create the sandbox root directory structure"""
@@ -364,15 +371,21 @@ alias l='ls -CF'
             f.write('fi\n')
             
             f.write('# Copy SSH keys for git authentication\n')
-            f.write('if [ -d /mnt/.ssh ]; then\n')
-            f.write('    cp -r /mnt/.ssh/* ~/.ssh/ 2>/dev/null || true\n')
-            f.write('    chmod 600 ~/.ssh/id_* 2>/dev/null || true\n')
-            f.write('    chmod 644 ~/.ssh/*.pub 2>/dev/null || true\n')
-            f.write('elif [ -d "$HOME/.ssh" ]; then\n')
-            f.write('    cp -r "$HOME/.ssh"/* ~/.ssh/ 2>/dev/null || true\n')
-            f.write('    chmod 600 ~/.ssh/id_* 2>/dev/null || true\n')
-            f.write('    chmod 644 ~/.ssh/*.pub 2>/dev/null || true\n')
-            f.write('fi\n')
+            f.write('mkdir -p ~/.ssh\n')
+            if self.config['ssh_keys']:
+                for key in self.config['ssh_keys']:
+                    f.write(f'if [ -f /mnt/.ssh/{key} ]; then cp /mnt/.ssh/{key} ~/.ssh/{key} 2>/dev/null || true; fi\n')
+                    f.write(f'if [ -f /mnt/.ssh/{key}.pub ]; then cp /mnt/.ssh/{key}.pub ~/.ssh/{key}.pub 2>/dev/null || true; fi\n')
+                    f.write(f'if [ -f "$HOME/.ssh/{key}" ]; then cp "$HOME/.ssh/{key}" ~/.ssh/{key} 2>/dev/null || true; fi\n')
+                    f.write(f'if [ -f "$HOME/.ssh/{key}.pub" ]; then cp "$HOME/.ssh/{key}.pub" ~/.ssh/{key}.pub 2>/dev/null || true; fi\n')
+            else:
+                f.write('if [ -d /mnt/.ssh ]; then\n')
+                f.write('    cp -r /mnt/.ssh/* ~/.ssh/ 2>/dev/null || true\n')
+                f.write('elif [ -d "$HOME/.ssh" ]; then\n')
+                f.write('    cp -r "$HOME/.ssh"/* ~/.ssh/ 2>/dev/null || true\n')
+                f.write('fi\n')
+            f.write('chmod 600 ~/.ssh/id_* 2>/dev/null || true\n')
+            f.write('chmod 644 ~/.ssh/*.pub 2>/dev/null || true\n')
             f.write('\n')
             
             # Install Python packages if specified
@@ -460,6 +473,11 @@ install = requests,numpy,pandas
 # Additional applications to include in sandbox (comma-separated)
 # Must be available on the host system
 include = htop,tree,jq,nano
+
+[ssh]
+# SSH keys to copy into the sandbox (comma-separated)
+# Omit or leave empty to copy all keys found in ~/.ssh or the mounted directory
+keys = id_rsa,id_ed25519
 
 [environment]
 # Environment variables to set in the sandbox
